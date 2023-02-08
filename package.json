@@ -1,0 +1,10 @@
+{
+  "name": "codelab",
+  "version": "1.0.0",
+  "description": "Personal Code Servers for AWS",
+  "type": "module",
+  "dependencies": {
+    "@aws-sdk/client-ec2": "^3.266.1",
+    "axios": "^1.3.4"
+  }
+}
