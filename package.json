@@ -6,6 +6,8 @@
   "bin": "index.js",
   "dependencies": {
     "@aws-sdk/client-ec2": "^3.266.1",
+    "@aws-sdk/client-ecr": "^3.321.1",
+    "@aws-sdk/client-ecs": "^3.321.1",
     "@aws-sdk/client-iam": "^3.303.0",
     "@aws-sdk/client-ssm": "^3.316.0",
     "argon2": "^0.30.3",
