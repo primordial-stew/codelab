@@ -279,7 +279,20 @@ export default class extends EventEmitter {
     )
   }
 
-  async setUp({ repo, passwordHash }) {
+  async setUp({ infra, repo, passwordHash }) {
+    let useECS
+    
+    switch (infra) {
+      case 'aws-swarm':
+        useECS = false
+        break
+      case 'aws-ecs':
+        useECS = true
+        break
+      default:
+        throw new Error(`infrastructure '${infra}' not supported`)
+    }
+
     const serverPort = 8080
     const proxyHttpPort = 80
     const proxyHttpsPort = 443
@@ -323,7 +336,11 @@ export default class extends EventEmitter {
       Statement: [{
         Effect: 'Allow',
         Action: 'sts:AssumeRole',
-        Principal: { Service: ['ec2.amazonaws.com', 'ecs-tasks.amazonaws.com'] }
+        Principal: {
+          Service: useECS
+            ? ['ec2.amazonaws.com', 'ecs-tasks.amazonaws.com']
+            : ['ec2.amazonaws.com']
+        }
       }]
     })
 
@@ -331,7 +348,9 @@ export default class extends EventEmitter {
 
     this.emit('begin', { name: 'Create role' })
     try {
-      RoleArn = (await this.#iam.getRole({ RoleName })).Role.Arn
+      if (useECS) {
+        RoleArn = (await this.#iam.getRole({ RoleName })).Role.Arn
+      }
       await this.#iam.updateAssumeRolePolicy({ RoleName, PolicyDocument: AssumeRolePolicyDocument })
     } catch (error) {
       if (!(error instanceof NoSuchEntityException)) {
@@ -440,61 +459,134 @@ export default class extends EventEmitter {
     this.emit('success')
 
     const repositoryName = this.#repositoryName
+    const clusterName = this.#clusterName
     let repositoryUri
 
-    this.emit('begin', { name: 'Create repository' })
-    try {
-      const { repositories } = await this.#ecr.describeRepositories({ repositoryNames: [repositoryName] })
-      repositoryUri = repositories[0].repositoryUri
-    } catch (error) {
-      if (!(error instanceof RepositoryNotFoundException)) {
-        throw error
+    if (useECS) {
+      this.emit('begin', { name: 'Create repository' })
+      try {
+        const { repositories } = await this.#ecr.describeRepositories({ repositoryNames: [repositoryName] })
+        repositoryUri = repositories[0].repositoryUri
+      } catch (error) {
+        if (!(error instanceof RepositoryNotFoundException)) {
+          throw error
+        }
+        const { repository } = await this.#ecr.createRepository({
+          tags: this.#tags(repositoryName),
+          repositoryName
+        })
+        repositoryUri = repository.repositoryUri
       }
-      const { repository } = await this.#ecr.createRepository({
-        tags: this.#tags(repositoryName),
-        repositoryName
-      })
-      repositoryUri = repository.repositoryUri
+      this.emit('success')
+  
+      // TODO: cluster names are limited to /^[a-zA-Z0-9\-_]{1,255}$/
+      await this.#task(
+        'Create cluster',
+        this.#ecs.createCluster({
+          tags: this.#ecsTags(clusterName),
+          clusterName
+        })
+      )
     }
-    this.emit('success')
-
-    const clusterName = this.#clusterName
-
-    // TODO: cluster names are limited to /^[a-zA-Z0-9\-_]{1,255}$/
-    await this.#task(
-      'Create cluster',
-      this.#ecs.createCluster({
-        tags: this.#ecsTags(clusterName),
-        clusterName
-      })
-    )
 
     const instanceName = this.#instanceName
 
-    const command = [
-      `echo ECS_CLUSTER=${clusterName} > /etc/ecs/ecs.config`,
-      `echo ECS_CONTAINER_INSTANCE_PROPAGATE_TAGS_FROM=${instanceName} >> /etc/ecs/ecs.config`,
-      'mkdir --parents /usr/share/codelab',
-      'curl --location https://rpm.nodesource.com/setup_16.x | sh -',
-      'yum install --assumeyes gcc-c++ git nodejs unzip',
-      `curl --output /usr/share/codelab/awscliv2.zip --location https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip`,
-      `unzip -u /usr/share/codelab/awscliv2.zip`,
-      `./aws/install --update`,
-      'npm install --global @devcontainers/cli',
-      'echo "/usr/local/bin/aws ssm get-parameter --with-decryption --output text --name /codelab/GIT_PASSWORD --query Parameter.Value" > /usr/share/codelab/git-askpass.sh',
+    const commands = []
+
+    if (useECS) {
+      commands.concat([
+        `echo ECS_CLUSTER=${clusterName} > /etc/ecs/ecs.config`,
+        `echo ECS_CONTAINER_INSTANCE_PROPAGATE_TAGS_FROM=${instanceName} >> /etc/ecs/ecs.config`
+      ])
+    }
+
+    commands.concat([
+      `mkdir --parents /usr/share/codelab`,
+      `curl --location https://rpm.nodesource.com/setup_16.x | sh -`,
+      useECS
+        ? `yum install --assumeyes gcc-c++ git nodejs unzip`
+        : `yum install --assumeyes docker gcc-c++ git nodejs`,
+    ])
+
+    if (useECS) {
+      commands.concat([
+        `curl --output /usr/share/codelab/awscliv2.zip --location https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip`,
+        `unzip -u /usr/share/codelab/awscliv2.zip`,
+        `./aws/install --update`
+      ])
+    }
+
+    commands.concat([
+      `npm install --global @devcontainers/cli`,
+    ])
+
+    if (!useECS) {
+      commands.concat([
+        `systemctl start docker`,
+        `if [ "$(docker info --format '{{.Swarm.ControlAvailable}}')" = "false" ];`
+          + `then docker swarm init; fi`,
+        `if [ "$(docker network ls --filter name=${APP_NAME}-net --format '{{.}}')" = "" ];`
+          + `then docker network create --driver overlay ${APP_NAME}-net; fi`,
+        // proxy needs to get cycled if already running since the DNS name may have changed
+        `if [ "$(docker service ls --filter name=caddy --format '{{.}}')" != "" ];`
+          + `then docker service rm caddy; fi`,
+        `DIG_OUT=$(dig +short -x $(dig +short @resolver4.opendns.com myip.opendns.com))`,
+        `docker service create --detach --name caddy --network ${APP_NAME}-net`
+          + ` --publish ${proxyHttpPort}:${proxyHttpPort} --publish ${proxyHttpsPort}:${proxyHttpsPort}`
+          + ` caddy caddy reverse-proxy --from \${DIG_OUT::-1}:${proxyHttpsPort} --to code-server:${serverPort}`
+      ])
+    }
+
+    commands.concat([
+      `echo "/usr/local/bin/aws ssm get-parameter --with-decryption --output text --name /codelab/GIT_PASSWORD --query Parameter.Value" > /usr/share/codelab/git-askpass.sh`,
       // owner: rwx, group: r, others: r
-      'chmod 0744 /usr/share/codelab/git-askpass.sh',
-      'if [ ! -d /srv/workspace ];'
+      `chmod 0744 /usr/share/codelab/git-askpass.sh`,
+      `if [ ! -d /srv/workspace ];`
         + `then GIT_ASKPASS=/usr/share/codelab/git-askpass.sh git clone https://awkward-ninja@github.com/${repo}.git /srv/workspace; fi`,
-      'curl --location --create-dirs --output /usr/share/codelab/install-code-server.sh https://code-server.dev/install.sh',
+      `curl --location --create-dirs --output /usr/share/codelab/install-code-server.sh https://code-server.dev/install.sh`,
       // owner: rwx, group: rx, others: rx
       'chmod 0755 /usr/share/codelab/install-code-server.sh',
-      'devcontainer build --image-name code-server --workspace-folder /srv/workspace',
-      `docker tag code-server ${repositoryUri}`,
-      `/usr/local/bin/aws ecr get-login-password | docker login --password-stdin --username AWS ${repositoryUri}`,
-      `docker push ${repositoryUri}`,
-      'chown --recursive $(docker run --rm code-server id --user) /srv/workspace',
-    ].join(' && ')
+      `devcontainer build --image-name code-server --workspace-folder /srv/workspace`
+    ])
+
+    if (useECS) {
+      commands.concat([
+        `docker tag code-server ${repositoryUri}`,
+        `/usr/local/bin/aws ecr get-login-password | docker login --password-stdin --username AWS ${repositoryUri}`,
+        `docker push ${repositoryUri}`,
+      ])
+    }
+
+    commands.concat([
+      `chown --recursive $(docker run --rm code-server id --user) /srv/workspace`
+    ])
+
+    if (!useECS) {
+      commands.concat([
+        `if [ "$(docker service ls --filter name=code-server --format '{{.}}')" = "" ];`
+          + `then ` + [
+            // TODO: find a more secure way to retrieve this value
+            `echo '${passwordHash}' | docker secret create CODE_SERVER_HASHED_PASSWORD -`,
+            `AWS_PARAMS=$(aws resourcegroupstaggingapi get-resources --output text --resource-type-filters ssm:parameter --tag-filters Key=codelab:env --query ResourceTagMappingList[].[ResourceARN])`,
+            `if [ "$AWS_PARAMS" != "" ];`
+              + `then echo "$AWS_PARAMS" | sed --regexp-extended 's/^[^/]*\\/(_?)(.*)$/\\1\\2 \\2/'`
+                + `| xargs --max-args=2 sh -c 'echo $(aws ssm get-parameter --with-decryption --output text --name $0 --query Parameter.Value) | docker secret create $1 -'`
+              + `; fi`,
+            `docker service create --detach --name code-server --network ${APP_NAME}-net`
+              + ` --secret CODE_SERVER_HASHED_PASSWORD`
+              + ` $(echo "$AWS_PARAMS" | sed --regexp-extended 's/^[^/]*\\/_?(.*)$/--secret \\1/')`
+              + ` --mount type=bind,source=/usr/share/codelab,destination=/mnt/codelab`
+              + ` --mount type=bind,source=/srv,destination=/srv`
+              + ` code-server sh -c "` + [
+                `/mnt/codelab/install-code-server.sh --method=standalone`,
+                `HASHED_PASSWORD=\\$(cat /run/secrets/CODE_SERVER_HASHED_PASSWORD) ~/.local/bin/code-server --bind-addr 0.0.0.0:${serverPort} /srv/workspace`
+              ].join(` && `) + `"`
+          ].join(` && `) + `; fi`
+         // TODO: at least update CODE_SERVER_HASHED_PASSWORD when service is already running
+      ])
+    }
+
+    const script = commands.join(` && `)
 
     let InstanceId
 
@@ -506,10 +598,14 @@ export default class extends EventEmitter {
         MinCount: 1,
         MaxCount: 1,
         InstanceType: 't2.small',
-        // ECS-Optimized Amazon Linux 2 (2.0.20230406)
-        ImageId: 'ami-0be4bf0879ccaadb3',
+        
+        ImageId: useECS
+          // ECS-Optimized Amazon Linux 2 (2.0.20230406)
+          ? 'ami-0be4bf0879ccaadb3'
+          // Amazon Linux 2 Kernel 5.10
+          : 'ami-06e85d4c3149db26a',
         SecurityGroupIds: [GroupId],
-        UserData: btoa(`#! /bin/sh\n${command}`)
+        UserData: btoa(`#! /bin/sh\n${script}`)
       })).Instances[0].InstanceId
     } else {
       InstanceId = InstanceIds[0]
@@ -554,99 +650,102 @@ export default class extends EventEmitter {
         }
       )
 
-      await this.#ssmCommandTask('Provision instance', InstanceId, [command])
+      await this.#ssmCommandTask('Provision instance', InstanceId, [script])
     }
 
     const PublicUrl = `https://${PublicDnsName}`
-    // TODO: update secrets when service is already running
-    // TODO: maybe environment variables aren't secure enough, Docker Swarm stores them at /run/secrets
-    const secrets = Parameters.map(({ Name }) => ({
-      name: Name.substring(ParameterPath.length + 1),
-      valueFrom: Name
-    }))
 
-    // TODO: this will just keep creating new revisions on every invocation
-    // TODO: if there is a previous active definition, deregister and delete it
-    // TODO: prolly should wait for image to be pushed to registry before referencing it
-    await this.#task(
-      'Create task definition',
-      this.#ecs.registerTaskDefinition({
-        tags: this.#ecsTags(this.#taskDefName),
-        family: this.#taskDefName,
-        memory: '1920', // available on instance (shouldn't need this for EC2 launch type though!?)
-        executionRoleArn: RoleArn,
-        volumes: [{
-          name: `${APP_NAME}-mnt`,
-          host: { sourcePath: '/usr/share/codelab' }
-        }, {
-          name: `${APP_NAME}-srv`,
-          host: { sourcePath: '/srv' }
-        }],
-        containerDefinitions: [{
-          name: 'caddy',
-          image: 'caddy',
-          portMappings: [{
-            containerPort: proxyHttpPort,
-            hostPort: proxyHttpPort
+    if (useECS) {
+      // TODO: update secrets when service is already running
+      // TODO: maybe environment variables aren't secure enough, Docker Swarm stores them at /run/secrets
+      const secrets = Parameters.map(({ Name }) => ({
+        name: Name.substring(ParameterPath.length + 1),
+        valueFrom: Name
+      }))
+
+      // TODO: this will just keep creating new revisions on every invocation
+      // TODO: if there is a previous active definition, deregister and delete it
+      // TODO: prolly should wait for image to be pushed to registry before referencing it
+      await this.#task(
+        'Create task definition',
+        this.#ecs.registerTaskDefinition({
+          tags: this.#ecsTags(this.#taskDefName),
+          family: this.#taskDefName,
+          memory: '1920', // available on instance (shouldn't need this for EC2 launch type though!?)
+          executionRoleArn: RoleArn,
+          volumes: [{
+            name: `${APP_NAME}-mnt`,
+            host: { sourcePath: '/usr/share/codelab' }
           }, {
-            containerPort: proxyHttpsPort,
-            hostPort: proxyHttpsPort
+            name: `${APP_NAME}-srv`,
+            host: { sourcePath: '/srv' }
           }],
-          // TODO: Docker links are deprecated, this should eventually
-          // be replaced by awsvpc network mode and/or service discovery
-          // https://docs.docker.com/network/links/
-          links: ['code-server'],
-          command: [
-            `caddy`,
-            `reverse-proxy`,
-            `--from`, `${PublicUrl}:${proxyHttpsPort}`,
-            `--to`, `code-server:${serverPort}`
-          ]
-        }, {
-          name: 'code-server',
-          image: `${repositoryUri}:latest`,
-          secrets,
-          mountPoints: [{
-            sourceVolume: `${APP_NAME}-mnt`,
-            containerPath: '/mnt/codelab'
+          containerDefinitions: [{
+            name: 'caddy',
+            image: 'caddy',
+            portMappings: [{
+              containerPort: proxyHttpPort,
+              hostPort: proxyHttpPort
+            }, {
+              containerPort: proxyHttpsPort,
+              hostPort: proxyHttpsPort
+            }],
+            // TODO: Docker links are deprecated, this should eventually
+            // be replaced by awsvpc network mode and/or service discovery
+            // https://docs.docker.com/network/links/
+            links: ['code-server'],
+            command: [
+              `caddy`,
+              `reverse-proxy`,
+              `--from`, `${PublicUrl}:${proxyHttpsPort}`,
+              `--to`, `code-server:${serverPort}`
+            ]
           }, {
-            sourceVolume: `${APP_NAME}-srv`,
-            containerPath: '/srv'
-          }],
-          command: [
-            `sh`, `-c`, [
-              `/mnt/codelab/install-code-server.sh --method=standalone`,
-              `~/.local/bin/code-server --bind-addr 0.0.0.0:${serverPort} /srv/workspace`
-            ].join(' && ')
-          ]
-        }]
-      })
-    )
-
-    const serviceName = this.#serviceName
-
-    // TODO: wait for container instance to exist to avoid warning/error event
-    this.emit('begin', { name: 'Create service' })
-    try {
-      await this.#ecs.updateService({
-        cluster: clusterName,
-        service: serviceName,
-        taskDefinition: this.#taskDefName,
-        desiredCount: 1
-      })
-    } catch (error) {
-      if (!(error instanceof ServiceNotActiveException || error instanceof ServiceNotFoundException)) {
-        throw error
+            name: 'code-server',
+            image: `${repositoryUri}:latest`,
+            secrets,
+            mountPoints: [{
+              sourceVolume: `${APP_NAME}-mnt`,
+              containerPath: '/mnt/codelab'
+            }, {
+              sourceVolume: `${APP_NAME}-srv`,
+              containerPath: '/srv'
+            }],
+            command: [
+              `sh`, `-c`, [
+                `/mnt/codelab/install-code-server.sh --method=standalone`,
+                `~/.local/bin/code-server --bind-addr 0.0.0.0:${serverPort} /srv/workspace`
+              ].join(' && ')
+            ]
+          }]
+        })
+      )
+  
+      const serviceName = this.#serviceName
+  
+      // TODO: wait for container instance to exist to avoid warning/error event
+      this.emit('begin', { name: 'Create service' })
+      try {
+        await this.#ecs.updateService({
+          cluster: clusterName,
+          service: serviceName,
+          taskDefinition: this.#taskDefName,
+          desiredCount: 1
+        })
+      } catch (error) {
+        if (!(error instanceof ServiceNotActiveException || error instanceof ServiceNotFoundException)) {
+          throw error
+        }
+        await this.#ecs.createService({
+          tags: this.#ecsTags(serviceName),
+          cluster: clusterName,
+          serviceName,
+          taskDefinition: this.#taskDefName,
+          desiredCount: 1
+        })
       }
-      await this.#ecs.createService({
-        tags: this.#ecsTags(serviceName),
-        cluster: clusterName,
-        serviceName,
-        taskDefinition: this.#taskDefName,
-        desiredCount: 1
-      })
+      this.emit('success')
     }
-    this.emit('success')
 
     await this.#waitTask(
       'Wait until ready',

@@ -36,8 +36,10 @@ try {
     .description('set an environment up')
     .argument('<repo>')
     .option('-e, --env <env>', 'environment', 'codelab')
-    .action(async (repo, { env }) => {
+    .option('-i, --infra <infra>', 'infrastructure', 'aws-ecs')
+    .action(async (repo, { env, infra }) => {
       const publicUrl = await codeLab({ env }).setUp({
+        infra,
         repo,
         passwordHash: await argon2.hash(
           // TODO: don't ask for password if already configured
